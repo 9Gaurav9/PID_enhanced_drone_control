@@ -1,0 +1,98 @@
+from controller import Robot, GPS, InertialUnit, Gyro, Motor
+import numpy as np
+
+# PID Controller Class
+class PIDController:
+    def __init__(self, kp, ki, kd, max_integral=10):
+        self.kp = kp
+        self.ki = ki
+        self.kd = kd
+        self.prev_error = 0
+        self.integral = 0
+        self.max_integral = max_integral
+
+    def compute(self, target, current, dt):
+        error = target - current
+        self.integral += error * dt
+        self.integral = np.clip(self.integral, -self.max_integral, self.max_integral)
+        derivative = (error - self.prev_error) / dt if dt > 0 else 0
+        self.prev_error = error
+        return self.kp * error + self.ki * self.integral + self.kd * derivative
+
+# Quadrotor Simulation Class
+class QuadrotorSim:
+    def __init__(self):
+        self.robot = Robot()
+        self.timestep = int(self.robot.getBasicTimeStep())
+
+        # Devices
+        self.imu = self.robot.getDevice('inertial unit')
+        self.imu.enable(self.timestep)
+
+        self.gps = self.robot.getDevice('gps')
+        self.gps.enable(self.timestep)
+
+        self.gyro = self.robot.getDevice('gyro')
+        self.gyro.enable(self.timestep)
+
+        # Motors
+        self.motors = {
+            "front_left": self.robot.getDevice("front left propeller"),
+            "front_right": self.robot.getDevice("front right propeller"),
+            "rear_left": self.robot.getDevice("rear left propeller"),
+            "rear_right": self.robot.getDevice("rear right propeller"),
+        }
+        for motor in self.motors.values():
+            motor.setPosition(float("inf"))
+            motor.setVelocity(0.0)
+
+        # Target variables
+        self.target_altitude = 1.0
+        self.k_vertical_thrust = 68.5
+        self.k_vertical_offset = 0.6
+        self.k_vertical_p = 3.0
+        self.k_roll_p = 50.0
+        self.k_pitch_p = 30.0
+
+    def run_step(self):
+        dt = self.timestep / 1000.0
+
+        # Get sensor readings
+        altitude = self.gps.getValues()[2]
+        roll, pitch, yaw = self.imu.getRollPitchYaw()
+        roll_velocity, pitch_velocity, _ = self.gyro.getValues()
+
+        # PID Outputs
+        vertical_input = self.k_vertical_p * ((self.target_altitude - altitude + self.k_vertical_offset) ** 3)
+        roll_input = self.k_roll_p * np.clip(roll, -1.0, 1.0) + roll_velocity
+        pitch_input = self.k_pitch_p * np.clip(pitch, -1.0, 1.0) + pitch_velocity
+        yaw_input = 0.0  # Placeholder (can be adjusted for yaw stabilization)
+
+        # Compute motor speeds
+        front_left_input = self.k_vertical_thrust + vertical_input - roll_input + pitch_input - yaw_input
+        front_right_input = self.k_vertical_thrust + vertical_input + roll_input + pitch_input + yaw_input
+        rear_left_input = self.k_vertical_thrust + vertical_input - roll_input - pitch_input + yaw_input
+        rear_right_input = self.k_vertical_thrust + vertical_input + roll_input - pitch_input - yaw_input
+
+        # Apply motor speeds
+        self.motors["front_left"].setVelocity(np.clip(front_left_input, 0, 100))
+        self.motors["front_right"].setVelocity(np.clip(-front_right_input, -100, 0))
+        self.motors["rear_left"].setVelocity(np.clip(-rear_left_input, -100, 0))
+        self.motors["rear_right"].setVelocity(np.clip(rear_right_input, 0, 100))
+
+    def simulate(self, duration):
+        steps = int(duration / (self.timestep / 1000))
+        for _ in range(steps):
+            if self.robot.step(self.timestep) == -1:
+                break
+            self.run_step()
+
+# Main simulation
+def main():
+    sim = QuadrotorSim()
+    print("Starting simulation...")
+    sim.simulate(duration=15)
+    print("Simulation completed.")
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,325 @@
+from controller import Robot, GPS, InertialUnit, Gyro, Motor
+import math
+import random
+import numpy as np
+import matplotlib.pyplot as plt
+import time 
+
+# Initialize the robot
+robot = Robot()
+timestep = int(robot.getBasicTimeStep())
+
+# Devices
+imu = robot.getDevice("inertial unit")
+imu.enable(timestep)
+
+gps = robot.getDevice("gps")
+gps.enable(timestep)
+
+gyro = robot.getDevice("gyro")
+gyro.enable(timestep)
+
+# Propeller Motors Setup
+motors = [
+    robot.getDevice("front left propeller"),
+    robot.getDevice("front right propeller"),
+    robot.getDevice("rear left propeller"),
+    robot.getDevice("rear right propeller")
+]
+for motor in motors:
+    motor.setPosition(float('inf'))  # Velocity control
+    motor.setVelocity(0.0)
+
+# Set seed for reproducibility
+np.random.seed(58) #90
+
+# Constants for PID
+k_vertical_thrust = 67.0
+k_vertical_offset = 0.6
+k_vertical_p = 4.0
+k_roll_p, k_roll_d = 30.0, 10.0
+k_pitch_p, k_pitch_d = 30.0, 10.0
+k_x_p, k_x_d = 0.2, 0.1  # For X stabilization
+k_y_p, k_y_d = 0.2, 0.1  # For Y stabilization
+
+# Variables
+target_altitude = 3.0
+altitude_tolerance = 0.1
+current_state = "Grounded"
+hovering = False
+
+
+
+
+# Storage for PID values
+default_values = [4.0, 0.5, 0.3, 30.0, 10.0, 0.2, 0.2, 0.1, 0.1, 0.2, 0.1, 0.1]
+tuned_avg_values = []
+global_best_values = []
+
+# Helper functions
+def clamp(value, low, high):
+    return max(low, min(value, high))
+
+def low_pass_filter(current, previous, alpha=0.8):
+    return alpha * previous + (1 - alpha) * current
+
+# State transitions
+def transition_to_hover():
+    global current_state, hovering
+    if current_state == "Take-Off" and abs(gps.getValues()[2] - target_altitude) <= altitude_tolerance:
+        current_state = "Hover"
+        hovering = True
+        print("Transitioned to Hover state.")
+
+def transition_to_take_off():
+    global current_state
+    if current_state == "Grounded" and target_altitude > 0.5:
+        current_state = "Take-Off"
+        print("Transitioned to Take-Off state.")
+
+# Stabilize the drone
+previous_x_error = previous_y_error = previous_altitude = 0.0
+def stabilize_drone():
+    global previous_x_error, previous_y_error, previous_altitude
+
+    # Sensor readings
+    roll, pitch, yaw = imu.getRollPitchYaw()
+    gps_values = gps.getValues()
+    altitude = gps_values[2]
+    x_position, y_position = gps_values[0], gps_values[1]
+    roll_velocity, pitch_velocity = gyro.getValues()[0], gyro.getValues()[1]
+
+    # Filter altitude and position
+    altitude = low_pass_filter(altitude, previous_altitude)
+    previous_altitude = altitude
+
+    # Altitude stabilization
+    altitude_error = target_altitude - altitude + k_vertical_offset
+    vertical_input = k_vertical_p * clamp(altitude_error, -1.0, 1.0) ** 3
+
+    # X and Y position stabilization
+    x_error = -x_position
+    y_error = -y_position
+
+    x_input = k_x_p * x_error + k_x_d * (x_error - previous_x_error) / timestep
+    y_input = k_y_p * y_error + k_y_d * (y_error - previous_y_error) / timestep
+
+    previous_x_error, previous_y_error = x_error, y_error
+
+    # Roll and pitch stabilization
+    roll_input = k_roll_p * clamp(roll, -1.0, 1.0) + k_roll_d * roll_velocity + x_input
+    pitch_input = k_pitch_p * clamp(pitch, -1.0, 1.0) + k_pitch_d * pitch_velocity + y_input
+
+    # Yaw stabilization (not used currently)
+    yaw_input = 0.0
+
+    # Motor inputs
+    front_left_motor_input = k_vertical_thrust + vertical_input - roll_input + pitch_input - yaw_input
+    front_right_motor_input = k_vertical_thrust + vertical_input + roll_input + pitch_input + yaw_input
+    rear_left_motor_input = k_vertical_thrust + vertical_input - roll_input - pitch_input + yaw_input
+    rear_right_motor_input = k_vertical_thrust + vertical_input + roll_input - pitch_input - yaw_input
+
+    # Clamp and actuate motors
+    for motor, value in zip(motors, [front_left_motor_input, -front_right_motor_input, -rear_left_motor_input, rear_right_motor_input]):
+        motor.setVelocity(clamp(value, -100.0, 100.0))
+
+# Variables to store performance over time
+time_steps = []
+altitude_performance = []  # Tracks throttle/altitude
+yaw_performance = []       # Tracks yaw
+x_position_performance = []  # Tracks X position
+y_position_performance = []  # Tracks Y position
+
+
+"""# PSO optimization
+def pso_optimization():
+    # Start optimization timer
+    start_time = time.time()
+
+    # Initialization for PSO
+    particles = [
+        {
+            "position": {key: [np.random.uniform(0.1, 5.0) for _ in range(3)] for key in ["ThrottlePID", "YawPID", "XposPID", "YposPID"]},
+            "velocity": {key: [np.random.uniform(-1.0, 1.0) for _ in range(3)] for key in ["ThrottlePID", "YawPID", "XposPID", "YposPID"]},
+            "best_position": None,
+            "best_fitness": float('inf'),
+        }
+        for _ in range(500)
+    ]
+    global_best_position = None 
+    global_best_fitness = float('inf')
+    history_gains = {key: {"Kp": [], "Ki": [], "Kd": []} for key in ["ThrottlePID", "YawPID", "XposPID", "YposPID"]}
+
+    # PSO iterations
+    for iteration in range(70):
+        for particle in particles:
+            # Simulate fitness (replace with actual drone simulation feedback)
+            fitness = np.random.random()  # Placeholder fitness calculation
+            if fitness < particle["best_fitness"]:
+                particle["best_fitness"] = fitness
+                particle["best_position"] = particle["position"]
+
+            if fitness < global_best_fitness:
+                global_best_fitness = fitness
+                global_best_position = particle["position"]
+
+        # Update particles
+        for particle in particles:
+            for key in ["ThrottlePID", "YawPID", "XposPID", "YposPID"]:
+                for i in range(3):
+                    r1, r2 = np.random.random(), np.random.random()
+                    inertia = 0.7 * particle["velocity"][key][i]
+                    cognitive = 1.4 * r1 * (particle["best_position"][key][i] - particle["position"][key][i])
+                    social = 1.4 * r2 * (global_best_position[key][i] - particle["position"][key][i])
+                    particle["velocity"][key][i] = inertia + cognitive + social
+                    particle["position"][key][i] += particle["velocity"][key][i]
+
+        # Record global best gains
+        for key in ["ThrottlePID", "YawPID", "XposPID", "YposPID"]:
+            for i, param in enumerate(["Kp", "Ki", "Kd"]):
+                history_gains[key][param].append(global_best_position[key][i])
+
+        print(f"Iteration {iteration + 1}/70: Best Fitness {global_best_fitness:.4f}")
+    # End optimization timer
+    end_time = time.time()
+    print(f"Optimization completed in {end_time - start_time:.2f} seconds")
+    
+    return history_gains"""
+# PSO optimization
+def pso_optimization():
+    # Start optimization timer
+    start_time = time.time()
+
+    # Initialization for PSO
+    particles = [
+        {
+            "position": {key: [np.random.uniform(0.1, 5.0) for _ in range(3)] for key in ["ThrottlePID", "YawPID", "XposPID", "YposPID"]},
+            "velocity": {key: [np.random.uniform(-1.0, 1.0) for _ in range(3)] for key in ["ThrottlePID", "YawPID", "XposPID", "YposPID"]},
+            "best_position": None,
+            "best_fitness": float('inf'),
+        }
+        for _ in range(500)
+    ]
+    global_best_position = None 
+    global_best_fitness = float('inf')
+    history_gains = {key: {"Kp": [], "Ki": [], "Kd": []} for key in ["ThrottlePID", "YawPID", "XposPID", "YposPID"]}
+
+    # PSO iterations
+    for iteration in range(70):
+        for particle in particles:
+            # Simulate fitness (replace with actual drone simulation feedback)
+            fitness = np.random.random()  # Placeholder fitness calculation
+            if fitness < particle["best_fitness"]:
+                particle["best_fitness"] = fitness
+                particle["best_position"] = particle["position"]
+
+            if fitness < global_best_fitness:
+                global_best_fitness = fitness
+                global_best_position = particle["position"]
+
+        # Update particles
+        for particle in particles:
+            for key in ["ThrottlePID", "YawPID", "XposPID", "YposPID"]:
+                for i in range(3):
+                    r1, r2 = np.random.random(), np.random.random()
+                    inertia = 0.7 * particle["velocity"][key][i]
+                    cognitive = 1.4 * r1 * (particle["best_position"][key][i] - particle["position"][key][i])
+                    social = 1.4 * r2 * (global_best_position[key][i] - particle["position"][key][i])
+                    particle["velocity"][key][i] = inertia + cognitive + social
+                    particle["position"][key][i] += particle["velocity"][key][i]
+
+        # Record global best gains and metrics
+        time_steps.append(iteration + 1)  # Track the current timestep
+        altitude_performance.append(global_best_position["ThrottlePID"][0])
+        yaw_performance.append(global_best_position["YawPID"][0])
+        x_position_performance.append(global_best_position["XposPID"][0])
+        y_position_performance.append(global_best_position["YposPID"][0])
+
+        for key in ["ThrottlePID", "YawPID", "XposPID", "YposPID"]:
+            for i, param in enumerate(["Kp", "Ki", "Kd"]):
+                history_gains[key][param].append(global_best_position[key][i])
+
+        print(f"Iteration {iteration + 1}/70: Best Fitness {global_best_fitness:.4f}")
+
+    # End optimization timer
+    end_time = time.time()
+    print(f"Optimization completed in {end_time - start_time:.2f} seconds")
+    
+    return history_gains
+
+
+def calculate_pid_values(history_gains):
+    global tuned_avg_values, global_best_values
+
+    # Calculate Tuned-Average and Global-Best values
+    tuned_avg_values = [
+        np.mean(history_gains[key][param])
+        for key in ["ThrottlePID", "YawPID", "XposPID", "YposPID"]
+        for param in ["Kp", "Ki", "Kd"]
+    ]
+    global_best_values = [
+        history_gains[key][param][-1]
+        for key in ["ThrottlePID", "YawPID", "XposPID", "YposPID"]
+        for param in ["Kp", "Ki", "Kd"]
+    ]
+
+    print("Default Values:", default_values)
+    print("Tuned-Average Values:", tuned_avg_values)
+    print("Global-Best Values:", global_best_values)
+    
+def plot_gains(history_gains):
+    fig, axes = plt.subplots(4, 3, figsize=(15, 10))
+    axes = axes.flatten()  # Flatten the 2D array of axes for easy indexing
+    pid_types = ["ThrottlePID", "YawPID", "XposPID", "YposPID"]
+    parameters = ["Kp", "Ki", "Kd"]
+
+    for i, key in enumerate(pid_types):
+        for j, param in enumerate(parameters):
+            index = i * 3 + j  # Calculate the subplot index
+            ax = axes[index]
+            ax.plot(history_gains[key][param])
+            ax.set_title(f"{key} - {param}")
+            ax.set_xlabel("Iterations")
+            ax.set_ylabel("Gain Value")
+            ax.grid()
+
+    plt.tight_layout()  # Adjust layout to prevent overlap
+    plt.show()
+  
+# Plot the performance over timesteps
+def plot_performance_over_time():
+    plt.figure(figsize=(12, 8))
+    plt.plot(time_steps, altitude_performance, label="Throttle Performance (Altitude)")
+    plt.plot(time_steps, yaw_performance, label="Yaw Performance")
+    plt.plot(time_steps, x_position_performance, label="X-Position Performance")
+    plt.plot(time_steps, y_position_performance, label="Y-Position Performance")
+
+    plt.title("Performance Over Time During Optimization")
+    plt.xlabel("Timesteps")
+    plt.ylabel("Performance Metric")
+    plt.legend()
+    plt.grid()
+    plt.show()  
+
+    
+# Main loop
+history_gains = None
+while robot.step(timestep) != -1:
+    # time_step_counter += 1  # Increment timestep counter
+    # print(f"Timestep: {time_step_counter}")
+    if current_state == "Grounded":
+        transition_to_take_off()
+    elif current_state == "Take-Off":
+        transition_to_hover()
+
+    if hovering:
+        print("Hovering at 3 meters and optimizing PID gains...")
+        history_gains = pso_optimization()
+        calculate_pid_values(history_gains)
+        plot_performance_over_time()  
+        plot_gains(history_gains)
+        hovering = False  # Stop optimization after completion
+
+    stabilize_drone()
+    # print(f"Current State: {current_state}, Altitude: {gps.getValues()[2]:.2f} m")
+

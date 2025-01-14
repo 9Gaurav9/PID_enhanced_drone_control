@@ -1,0 +1,154 @@
+from controller import Robot, GPS, InertialUnit, Gyro, Motor
+import numpy as np
+import random
+
+# Initialize the robot
+robot = Robot()
+timestep = int(robot.getBasicTimeStep())
+
+# Devices
+gps = robot.getDevice("gps")
+gps.enable(timestep)
+
+imu = robot.getDevice("inertial unit")
+imu.enable(timestep)
+
+gyro = robot.getDevice("gyro")
+gyro.enable(timestep)
+
+# Motors
+motors = [
+    robot.getDevice("front left propeller"),
+    robot.getDevice("front right propeller"),
+    robot.getDevice("rear left propeller"),
+    robot.getDevice("rear right propeller")
+]
+for motor in motors:
+    motor.setPosition(float('inf'))
+
+# PID parameters for PSO optimization
+initial_pid_parameters = {
+    "ThrottlePID": [1.0, 0.1, 0.5],
+    "YawPID": [0.5, 0.1, 0.3],
+    "XposPID": [0.5, 0.01, 0.2],
+    "YposPID": [0.5, 0.01, 0.2],
+}
+
+# Particle Swarm Optimization Parameters
+NUM_PARTICLES = 10
+NUM_ITERATIONS = 50
+INERTIA_WEIGHT = 0.7
+COGNITIVE_WEIGHT = 1.4
+SOCIAL_WEIGHT = 1.4
+PARAMETER_BOUNDS = (0.0, 5.0)
+
+# Initialize particles
+particles = [
+    {
+        "position": {key: [random.uniform(*PARAMETER_BOUNDS) for _ in range(3)] for key in initial_pid_parameters},
+        "velocity": {key: [random.uniform(-1, 1) for _ in range(3)] for key in initial_pid_parameters},
+        "best_position": None,
+        "best_fitness": float('inf'),
+    }
+    for _ in range(NUM_PARTICLES)
+]
+
+global_best_position = None
+global_best_fitness = float('inf')
+
+def clamp(value, low, high):
+    """Clamp values between a minimum and maximum."""
+    return max(low, min(value, high))
+
+def fitness_function(parameters, target_altitude, k_vertical_offset, k_vertical_thrust, motors):
+    """
+    Fitness function evaluates performance for given PID parameters.
+    """
+    # Set PID parameters
+    throttle_pid = parameters["ThrottlePID"]
+    yaw_pid = parameters["YawPID"]
+    xpos_pid = parameters["XposPID"]
+    ypos_pid = parameters["YposPID"]
+
+    # Metrics to evaluate fitness
+    total_error = 0.0
+    for _ in range(500):  # Simulate for a fixed duration
+        if robot.step(timestep) == -1:
+            break
+
+        # Get sensor data
+        gps_values = gps.getValues()
+        altitude = gps_values[2]
+        imu_values = imu.getRollPitchYaw()
+        roll, pitch = imu_values[0], imu_values[1]
+        gyro_values = gyro.getValues()
+
+        # Vertical PID
+        vertical_error = target_altitude - altitude + k_vertical_offset
+        vertical_input = throttle_pid[0] * vertical_error
+
+        # Yaw, X, Y PID (simplified here for demonstration)
+        roll_input = yaw_pid[0] * roll
+        pitch_input = xpos_pid[0] * pitch
+
+        # Motor commands
+        front_left_motor_input = k_vertical_thrust + vertical_input - roll_input + pitch_input
+        front_right_motor_input = k_vertical_thrust + vertical_input + roll_input + pitch_input
+        rear_left_motor_input = k_vertical_thrust + vertical_input - roll_input - pitch_input
+        rear_right_motor_input = k_vertical_thrust + vertical_input + roll_input - pitch_input
+
+        # Clamp motor values
+        motor_input_clamp = 100.0
+        front_left_motor_input = clamp(front_left_motor_input, -motor_input_clamp, motor_input_clamp)
+        front_right_motor_input = clamp(front_right_motor_input, -motor_input_clamp, motor_input_clamp)
+        rear_left_motor_input = clamp(rear_left_motor_input, -motor_input_clamp, motor_input_clamp)
+        rear_right_motor_input = clamp(rear_right_motor_input, -motor_input_clamp, motor_input_clamp)
+
+        # Set velocities
+        motors[0].setVelocity(front_left_motor_input)
+        motors[1].setVelocity(-front_right_motor_input)
+        motors[2].setVelocity(-rear_left_motor_input)
+        motors[3].setVelocity(rear_right_motor_input)
+
+        # Calculate fitness (altitude error for now)
+        total_error += abs(vertical_error)
+
+    return total_error
+
+# PSO Main Loop
+for iteration in range(NUM_ITERATIONS):
+    for particle in particles:
+        # Update fitness
+        fitness = fitness_function(
+            particle["position"],
+            target_altitude=1.0,  # Example value
+            k_vertical_offset=0.6,  # Example value
+            k_vertical_thrust=68.5,  # Example value
+            motors=motors
+        )
+        if fitness < particle["best_fitness"]:
+            particle["best_fitness"] = fitness
+            particle["best_position"] = particle["position"]
+
+        if fitness < global_best_fitness:
+            global_best_fitness = fitness
+            global_best_position = particle["position"]
+
+    for particle in particles:
+        for key in initial_pid_parameters:
+            for i in range(3):
+                r1, r2 = random.random(), random.random()
+                inertia = INERTIA_WEIGHT * particle["velocity"][key][i]
+                cognitive = COGNITIVE_WEIGHT * r1 * (particle["best_position"][key][i] - particle["position"][key][i])
+                social = SOCIAL_WEIGHT * r2 * (global_best_position[key][i] - particle["position"][key][i])
+
+                particle["velocity"][key][i] = inertia + cognitive + social
+                particle["position"][key][i] = clamp(
+                    particle["position"][key][i] + particle["velocity"][key][i], *PARAMETER_BOUNDS
+                )
+
+    print(f"Iteration {iteration + 1}/{NUM_ITERATIONS}, Best Fitness: {global_best_fitness:.4f}")
+
+# Final tuned parameters
+print("Tuned Parameters:")
+print(global_best_position)
